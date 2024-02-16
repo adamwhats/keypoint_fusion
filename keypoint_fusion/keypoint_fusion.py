@@ -9,10 +9,11 @@ from geometry_msgs.msg import Point
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
-from scipy.spatial.distance import cdist
 from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
 from visualization_msgs.msg import Marker, MarkerArray
 from yolov8_msgs.msg import Detection, DetectionArray, KeyPoint3D
+
 
 @dataclass
 class TrackedPose():
@@ -41,34 +42,34 @@ class KeypointFusion(Node):
         self.position_estimation_pub_timer = self.create_timer(0.05, self.publish_position_estimation)
         self.known_ids: List[int] = []
         self.poses: List[TrackedPose] = []
-        self.assignment_distance_threshold_m = 0.5  # Disregard any assignment between a new observation and a tracked pose if the distance is above this threshold
+        # Disregard any assignment between a new observation and a tracked pose if the distance is above this threshold
+        self.assignment_distance_threshold_m = 0.5
         self.keypoint_timeout_s = 2.0
         self.frame_id: str = None
         self.SEG_PAIRS = [[16, 14], [14, 12], [17, 15], [15, 13], [12, 13], [6, 12], [7, 13], [6, 7], [6, 8],
                           [7, 9], [8, 10], [9, 11], [2, 3], [1, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7]]
-        
+
     def process_observation(self, msg: DetectionArray):
         """TODO"""
         valid_detections = [det for det in msg.detections if det.keypoints3d.data]
         self.assign_detections(valid_detections)
         self.clear_stale_points()
 
-
     def assign_detections(self, detections: List[Detection]) -> None:
         """Solves the linear sum assignment problem to match detections to the closest TrackedPose instance where the cost matrix is the euclidean distance between the mean XYZ position of each Detection-TrackedPose pair. Disregards any assignments where the cost (distance) is greater than assignment_distance_threshold_m"""
-        
+
         # Assignment
         if self.poses and detections:
             detection_mean_positions = np.array(
-                [np.mean([[kp.point.x, kp.point.y, kp.point.z] for kp in det.keypoints3d.data], axis=0) 
-                for det in detections])
+                [np.mean([[kp.point.x, kp.point.y, kp.point.z] for kp in det.keypoints3d.data], axis=0)
+                 for det in detections])
             pose_mean_positions = np.array(
                 [np.mean([kf.x[:3] for kf in pose.keypoints.values()], axis=0) for pose in self.poses])
             cost_matrix = cdist(detection_mean_positions, pose_mean_positions, metric='euclidean')
             d_indices, p_indices = linear_sum_assignment(cost_matrix)
         else:
             d_indices, p_indices = [], []
-            cost_matrix=None
+            cost_matrix = None
 
         # Create/update tracked poses
         for d_idx, det in enumerate(detections):
@@ -82,13 +83,24 @@ class KeypointFusion(Node):
                 p_idx = p_indices[list(d_indices).index(d_idx)]
             except ValueError:
                 p_idx = None
-            
+
             if d_idx in d_indices and cost_matrix[d_idx, p_idx] < self.assignment_distance_threshold_m:
                 self.update_tracked_pose(self.poses[p_idx], det)
             else:
                 if cost_matrix is not None and cost_matrix[d_idx, p_idx] < self.assignment_distance_threshold_m:
                     self.get_logger().warn('Assignment found, but was over assignment_distance_threshold_m')
                 self.create_tracked_pose(det)
+
+    def filter_outlier_points(self, det: Detection) -> Detection:
+        """Filters out 3D keypoints which exceed 3 standard deviations from the mean in any direction"""
+        points_3d = np.array([[kp.point.x, kp.point.y, kp.point.z] for kp in det.keypoints3d.data])
+        mean, std = np.mean(points_3d, axis=0), np.std(points_3d, axis=0)
+        within_range = np.where(np.abs(points_3d - mean) < 3 * std)
+        if not np.all(within_range):
+            inliers = points_3d[within_range]
+        det.keypoints3d.data = [KeyPoint3D(Point.x)]
+        # TODO: Finish implementing
+        raise NotImplementedError
 
     def create_tracked_pose(self, det: Detection) -> None:
         """Create a new TrackedPose object from a detection which could not be assigned to any prior poses"""
@@ -119,7 +131,6 @@ class KeypointFusion(Node):
             if not pose.keypoints:
                 stale_poses.append(n)
         [self.poses.pop(m) for m in stale_poses]
-                   
 
     def create_kf(self, kp: KeyPoint3D) -> KalmanFilter:
         """Create a new Kalman filter to track a keypoint instance"""
@@ -167,7 +178,7 @@ class KeypointFusion(Node):
             seg_marker.header.frame_id = self.frame_id
             seg_marker.header.stamp = kp_marker.header.stamp
             seg_marker.type = 5  # Line list
-            kp_marker.lifetime = Duration(seconds=1).to_msg()
+            seg_marker.lifetime = Duration(seconds=1).to_msg()
             seg_marker.color = kp_marker.color
             seg_marker.scale.x = 0.05
             for n1, n2 in self.SEG_PAIRS:
